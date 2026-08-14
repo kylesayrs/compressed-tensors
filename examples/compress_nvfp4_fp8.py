@@ -34,17 +34,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DefaultDataCollato
 
 config_file = Path(__file__).parent / "mixed_precision_config.json"
 MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
-DATASET_ID = "HuggingFaceH4/ultrachat_200k"
-DATASET_SPLIT = "train_sft"
-NUM_CALIBRATION_SAMPLES = 256
-MAX_SEQUENCE_LENGTH = 2048
 output_dir = "./Meta-Llama-3-8B-Instruct-FP8-NVFP4"
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID, device_map=device, torch_dtype="auto"
 )
-model.eval()
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
 config = QuantizationConfig.model_validate_json(config_file.read_text())
@@ -114,6 +109,12 @@ def update_scales_hook(
 
 model.apply(lambda module: module.register_forward_hook(update_scales_hook))
 
+
+DATASET_ID = "HuggingFaceH4/ultrachat_200k"
+DATASET_SPLIT = "train_sft"
+NUM_CALIBRATION_SAMPLES = 256
+MAX_SEQUENCE_LENGTH = 2048
+
 # Load and preprocess calibration dataset
 ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
 ds = ds.shuffle(seed=42)
@@ -154,8 +155,6 @@ with torch.no_grad():
         sample = {k: v.to(model.device) for k, v in sample.items()}
         _ = model(**sample)
 
-        if idx >= NUM_CALIBRATION_SAMPLES:
-            break
 
 compressor = ModelCompressor.from_pretrained_model(model)
 compressor.compress_model(model)
@@ -172,6 +171,5 @@ compressor.compress_model(model)
 #
 # Because the model contains modules with different compression formats,
 # the overall model format is reported as "mixed-precision" in the saved config
-breakpoint()
 model.save_pretrained(output_dir)
 compressor.update_config(output_dir)
