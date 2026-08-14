@@ -3,7 +3,7 @@
 # The following example shows how a model can be quantized with
 # mixed precision entirely with primitives within `compressed-tensors`.
 #
-# Attention layers are quantized to FP8 (weights + static activations)
+# Attention layers are quantized to FP8 (weights + dynamic per-token activations)
 # and MLP layers are quantized to NVFP4 (weights + locally dynamic activations).
 #
 # The config is defined in `./mixed_precision_config.json`, which uses
@@ -22,7 +22,6 @@ from compressed_tensors.compressors import ModelCompressor
 from compressed_tensors.offload import update_offload_parameter
 from compressed_tensors.quantization import (
     QuantizationConfig,
-    QuantizationStatus,
     QuantizationStrategy,
     apply_quantization_config,
 )
@@ -37,7 +36,7 @@ config_file = Path(__file__).parent / "mixed_precision_config.json"
 MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
 DATASET_ID = "HuggingFaceH4/ultrachat_200k"
 DATASET_SPLIT = "train_sft"
-NUM_CALIBRATION_SAMPLES = 512
+NUM_CALIBRATION_SAMPLES = 256
 MAX_SEQUENCE_LENGTH = 2048
 output_dir = "./Meta-Llama-3-8B-Instruct-FP8-NVFP4"
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -49,7 +48,6 @@ model.eval()
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
 config = QuantizationConfig.model_validate_json(config_file.read_text())
-config.quantization_status = QuantizationStatus.CALIBRATION
 
 apply_quantization_config(model, config)
 
@@ -64,9 +62,8 @@ def update_scales_hook(
     # -- weight scales --
     # The weight calibration differs between the two schemes:
     #
-    # FP8 (attention layers): uses TENSOR strategy, so we compute a single
-    #   per-tensor min/max via torch.aminmax and derive one scale for the
-    #   entire weight matrix.
+    # FP8 (attention layers): uses CHANNEL strategy, so we compute
+    #   per-output-channel min/max and derive one scale per channel.
     #
     # NVFP4 (MLP layers): uses TENSOR_GROUP strategy with group_size=16,
     #   so we reshape the weight into groups, compute per-group min/max,
@@ -80,45 +77,39 @@ def update_scales_hook(
         group_size = quantization_args.group_size
         strategy = quantization_args.strategy
 
-        # For group/tensor_group strategies, reshape and compute per-group min/max
-        if (
-            strategy
-            in (QuantizationStrategy.GROUP, QuantizationStrategy.TENSOR_GROUP)
-            and group_size is not None
-            and group_size > 0
-        ):
+        if strategy == QuantizationStrategy.TENSOR_GROUP:
+            # NVFP4: reshape into groups and compute per-group min/max
             reshaped = weight.unflatten(
                 -1, (math.ceil(weight.shape[-1] / group_size), group_size)
             )
             min_val = reshaped.amin(dim=-1)
             max_val = reshaped.amax(dim=-1)
-        else:
-            # For tensor strategy (FP8), a single min/max across all elements
-            min_val, max_val = torch.aminmax(weight)
 
-        if strategy == QuantizationStrategy.TENSOR_GROUP:
-            # NVFP4: compute global_scale = (fp8_max * fp4_max) / max(abs(weight))
-            # This ensures per-group scales fit within the FP8 range
-            global_scale = generate_gparam(min_val, max_val)
-            update_offload_parameter(module, "weight_global_scale", global_scale)
+            # First compute the global scales, then derive per-group weight
+            # scales. generate_gparam expects tensor-level min/max (scalars)
+            # and produces global_scale = (fp8_max * fp4_max) / max(abs(tensor))
+            # which maps per-group FP8 scales into the full FP8 dynamic range.
+            tensor_min, tensor_max = torch.aminmax(weight)
+            weight_global_scale = generate_gparam(tensor_min, tensor_max)
+            update_offload_parameter(module, "weight_global_scale", weight_global_scale)
+
             scale, _ = calculate_qparams(
-                min_val, max_val, quantization_args, global_scale=global_scale
+                min_val, max_val, quantization_args, global_scale=weight_global_scale
             )
+            update_offload_parameter(module, "weight_scale", scale)
+
+            # input_global_scale: per-group input scales are computed dynamically
+            # at runtime, but the global scale is a static per-tensor scalar that
+            # must be calibrated from the data
+            input_min, input_max = torch.aminmax(input[0])
+            input_global_scale = generate_gparam(input_min, input_max)
+            update_offload_parameter(module, "input_global_scale", input_global_scale)
         else:
-            # FP8: straightforward scale from tensor-level min/max
+            # FP8: per-output-channel min/max (one scale per row)
+            min_val = weight.amin(dim=-1, keepdim=True)
+            max_val = weight.amax(dim=-1, keepdim=True)
             scale, _ = calculate_qparams(min_val, max_val, quantization_args)
-
-        update_offload_parameter(module, "weight_scale", scale)
-
-    # -- input activations --
-    # Only calibrated for static schemes (FP8 attention layers).
-    # NVFP4 MLP layers use locally dynamic activations (dynamic="local"),
-    # meaning input scales are computed at runtime, not during calibration.
-    quantization_args = getattr(quantization_scheme, "input_activations", None)
-    if quantization_args is not None and not quantization_args.dynamic:
-        min_val, max_val = torch.aminmax(input[0])
-        scale, _ = calculate_qparams(min_val, max_val, quantization_args)
-        update_offload_parameter(module, "input_scale", scale)
+            update_offload_parameter(module, "weight_scale", scale)
 
 
 model.apply(lambda module: module.register_forward_hook(update_scales_hook))
@@ -166,10 +157,21 @@ with torch.no_grad():
         if idx >= NUM_CALIBRATION_SAMPLES:
             break
 
-# apply compression
 compressor = ModelCompressor.from_pretrained_model(model)
 compressor.compress_model(model)
 
-# save quantized model
+# Save the compressed model and update config with quantization details.
+# The compression format is inferred per-module by checking each format's
+# `can_compress(module_type, scheme)` in priority order
+# (see compressed_tensors/compressors/format.py):
+#   - Attention layers (FP8): use "float-quantized" format, which stores
+#     weight_scale alongside the quantized weights
+#   - MLP layers (NVFP4): use "nvfp4-pack-quantized" format, which packs
+#     two FP4 values per byte and stores weight_scale (FP8), weight_global_scale,
+#     and input_global_scale
+#
+# Because the model contains modules with different compression formats,
+# the overall model format is reported as "mixed-precision" in the saved config
+breakpoint()
 model.save_pretrained(output_dir)
 compressor.update_config(output_dir)

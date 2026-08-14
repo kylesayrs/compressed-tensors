@@ -5,14 +5,14 @@
                 "num_bits": 8,
                 "type": "float",
                 "symmetric": true,
-                "strategy": "tensor"
+                "strategy": "channel"
             },
             "input_activations": {
                 "num_bits": 8,
                 "type": "float",
                 "symmetric": true,
-                "strategy": "tensor",
-                "dynamic": false
+                "strategy": "token",
+                "dynamic": true
             },
             "targets": ["re:.*self_attn.*"]
         },
