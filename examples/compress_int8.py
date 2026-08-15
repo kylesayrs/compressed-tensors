@@ -20,7 +20,6 @@ import torch
 from compressed_tensors.compressors import ModelCompressor
 from compressed_tensors.quantization import (
     QuantizationConfig,
-    QuantizationStatus,
     apply_quantization_config,
 )
 from datasets import load_dataset
@@ -48,13 +47,10 @@ device = "cuda:0" if torch.cuda.is_available() else "cpu"
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID, device_map=device, torch_dtype="auto"
 )
-model.eval()
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
 config = QuantizationConfig.model_validate_json(config_file.read_text())
 
-# Set status to calibration so that observers and hooks can update scales
-config.quantization_status = QuantizationStatus.CALIBRATION
 
 # Apply the config to the model. This step uses the config to define
 # the quantization parameters (such as the scales) for the targeted layers
@@ -133,8 +129,6 @@ with torch.no_grad():
         sample = {k: v.to(model.device) for k, v in sample.items()}
         _ = model(**sample)
 
-        if idx >= NUM_CALIBRATION_SAMPLES:
-            break
 
 # Set up a compressor.
 # The compression format is inferred by iterating over all quantized modules and
