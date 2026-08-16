@@ -1,6 +1,6 @@
 # Compressing with compressed-tensors
 
-The examples in this directory show how to quantize and compress models using compressed-tensors primitives directly. This includes applying quantization configs, computing scales via PyTorch hooks or manual calculation, and saving models in the compressed-tensors format. These examples use basic round-to-nearest quantization without advanced calibration algorithms.
+The examples in this directory show how to compress models using compressed-tensors primitives directly. This includes applying quantization configs, computing scales via PyTorch hooks or manual calculation, and saving models in the compressed-tensors format. These examples use basic round-to-nearest quantization without advanced calibration algorithms.
 
 # Compressing with LLM Compressor
 
