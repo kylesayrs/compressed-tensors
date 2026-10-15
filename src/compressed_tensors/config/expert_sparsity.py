@@ -19,7 +19,7 @@ class ExpertSparsityConfig(BaseModel):
 
     * ``"prune"`` (e.g. REAP): low-value experts are pruned entirely. Retained
       experts are left-shifted in the checkpoint.
-    * ``"novice"`` (e.g. MoNe): experts are collapsed into fewer "novice"
+    * ``"novice"`` (e.g. MoNe): experts are collapsed into constant "novice"
       experts. Retained experts are left-shifted and novices remain as a single
       tensor.
 
