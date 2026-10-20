@@ -198,6 +198,13 @@ def initialize_qparams(
     else:
         device = get_execution_device(module)
 
+    # disk-offloaded weights are stored as meta tensors, which cannot hold the
+    # data of a newly created parameter. Fall back to the onload device, where
+    # the weight would be materialized; the module's offload cache will then
+    # offload the new parameter (e.g. by writing it to disk)
+    if device.type == "meta":
+        device = get_execution_device(module)
+
     # Skip all intialization for fully dynamic quantization
     if dynamic is True:
         return
