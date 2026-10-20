@@ -11,7 +11,11 @@ from compressed_tensors.modeling import (
     QuantizedAttentionImpl,
     QuantizedKVCache,
 )
-from compressed_tensors.offload import disable_onloading, unwrap_offload_forward
+from compressed_tensors.offload import (
+    disable_onloading,
+    get_offloaded_device,
+    unwrap_offload_forward,
+)
 from compressed_tensors.quantization import (
     DynamicType,
     QuantizationArgs,
@@ -191,7 +195,6 @@ def initialize_qparams(
     """
     strategy = quantization_args.strategy
     dynamic = quantization_args.dynamic
-    # avoid performing intialization ops on cpu
     if isinstance(module, (torch.nn.Linear, torch.nn.Embedding)):
         with disable_onloading():
             device = module.weight.device
@@ -199,11 +202,10 @@ def initialize_qparams(
         device = get_execution_device(module)
 
     # disk-offloaded weights are stored as meta tensors, which cannot hold the
-    # data of a newly created parameter. Fall back to the onload device, where
-    # the weight would be materialized; the module's offload cache will then
-    # offload the new parameter (e.g. by writing it to disk)
-    if device.type == "meta":
-        device = get_execution_device(module)
+    # data of a newly created parameter. Initialize on the cpu instead; the
+    # module's offload cache will then write the new parameter to disk
+    if get_offloaded_device(module) == "disk":
+        device = torch.device("cpu")
 
     # Skip all intialization for fully dynamic quantization
     if dynamic is True:
